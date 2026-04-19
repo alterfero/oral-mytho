@@ -50,7 +50,7 @@ from mytho_app.pipeline import (
     validate_uploaded_csv_bytes,
     write_entries_jsonl,
 )
-from mytho_app.storage import artifact_paths, artifact_status, read_json, read_jsonl
+from mytho_app.storage import artifact_paths, artifact_status, clear_artifacts, read_json, read_jsonl
 from mytho_app.ui_state import apply_pending_widget_reset, mark_widget_for_reset
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📚", layout="wide")
@@ -59,6 +59,7 @@ LIVE_TERM_STATE_KEY = "_live_term_state"
 ADD_ENTRY_FEEDBACK_KEY = "_add_entry_feedback"
 LAST_PROCESSED_UPLOAD_KEY = "_last_processed_upload_key"
 EXPLORATION_SELECTED_ENTRY_KEY = "_exploration_selected_entry_id"
+CLEAN_SESSION_FEEDBACK_KEY = "_clean_session_feedback"
 
 
 def apply_theme() -> None:
@@ -244,6 +245,23 @@ def clear_caches() -> None:
 
 def clear_live_term_state() -> None:
     st.session_state.pop(LIVE_TERM_STATE_KEY, None)
+
+
+def reset_clean_session_state() -> None:
+    clear_caches()
+    clear_live_term_state()
+    keys_to_drop = [
+        ADD_ENTRY_FEEDBACK_KEY,
+        LAST_PROCESSED_UPLOAD_KEY,
+        EXPLORATION_SELECTED_ENTRY_KEY,
+    ]
+    for key in keys_to_drop:
+        st.session_state.pop(key, None)
+
+    for key in list(st.session_state):
+        if key.startswith(("exploration_", "edit_", "delete_")):
+            st.session_state.pop(key, None)
+    st.session_state["add_form_version"] = 0
 
 
 def prune_live_term_state(output_dir: Path) -> None:
@@ -442,6 +460,11 @@ def find_similar_terms(kind: str, query: str, output_dir: Path, *, limit: int = 
 def render_processing_page() -> None:
     status = artifact_status(current_output_dir())
     jsonl_path = artifact_paths(current_output_dir())["jsonl"]
+    clean_feedback = st.session_state.pop(CLEAN_SESSION_FEEDBACK_KEY, None)
+
+    if clean_feedback:
+        st.session_state.pop("processing_confirm_clean", None)
+        st.success(clean_feedback)
 
     st.markdown("### Source data")
     st.markdown(
@@ -527,6 +550,25 @@ def render_processing_page() -> None:
         "Uploading a valid CSV replaces the working dataset. After that, edits happen in JSONL and stay in sync "
         "with the semantic indices automatically."
     )
+
+    st.markdown("### End session")
+    st.warning(
+        "Use this to remove the processed dataset, semantic indices, manifest, and saved backups from the current "
+        "processed data directory."
+    )
+    confirm_clean = st.checkbox(
+        "I understand this will delete all generated artefacts for the current session.",
+        key="processing_confirm_clean",
+    )
+    if st.button("Clean session", type="secondary", disabled=not confirm_clean):
+        summary = clear_artifacts(current_output_dir())
+        reset_clean_session_state()
+        st.session_state[CLEAN_SESSION_FEEDBACK_KEY] = (
+            f"Session cleaned. Deleted {summary['deleted_files']} artefact"
+            f"{'' if summary['deleted_files'] == 1 else 's'} and removed {summary['deleted_dirs']} director"
+            f"{'y' if summary['deleted_dirs'] == 1 else 'ies'}."
+        )
+        st.rerun()
 
 
 def preview_entry(entry: dict) -> None:

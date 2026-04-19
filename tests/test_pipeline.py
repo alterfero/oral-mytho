@@ -16,7 +16,7 @@ from mytho_app.parsing import (
     sync_entry_fields,
 )
 from mytho_app.pipeline import CSVValidationError, build_term_index, entries_to_csv_bytes, validate_uploaded_csv_bytes, write_entries_jsonl
-from mytho_app.storage import artifact_paths, read_jsonl
+from mytho_app.storage import artifact_paths, clear_artifacts, read_jsonl, write_json
 from mytho_app.ui_state import apply_pending_widget_reset, mark_widget_for_reset, pending_widget_reset_key
 
 
@@ -97,6 +97,26 @@ class PipelineTests(unittest.TestCase):
         csv_text = "Story title (Eng),Keywords (Eng)\nTest,wolf\n"
         with self.assertRaises(CSVValidationError):
             validate_uploaded_csv_bytes(csv_text.encode("utf-8"))
+
+    def test_clear_artifacts_removes_generated_files_and_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "processed"
+            entries = [csv_row_to_entry({"Story title (Eng)": "Test title", "Motifs (Eng)": "§§ pattern", "Keywords (Eng)": "wolf"}, 1)]
+            write_entries_jsonl(entries, output_dir)
+            write_entries_jsonl(entries, output_dir, backup_existing=True)
+
+            paths = artifact_paths(output_dir)
+            write_json(paths["manifest"], {"entry_count": 1})
+            paths["patterns_index"].write_text("[]", encoding="utf-8")
+            paths["keywords_index"].write_text("[]", encoding="utf-8")
+            paths["patterns_faiss"].write_text("pattern-faiss", encoding="utf-8")
+            paths["keywords_faiss"].write_text("keyword-faiss", encoding="utf-8")
+
+            summary = clear_artifacts(output_dir)
+
+            self.assertEqual(summary["deleted_files"], 6)
+            self.assertGreaterEqual(summary["deleted_dirs"], 1)
+            self.assertFalse(output_dir.exists())
 
 
 class UIStateTests(unittest.TestCase):

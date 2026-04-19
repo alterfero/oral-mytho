@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 from tempfile import NamedTemporaryFile
 
 from mytho_app.constants import (
@@ -106,3 +107,33 @@ def artifact_status(output_dir: Path) -> dict:
         ]
     )
     return status
+
+
+def clear_artifacts(output_dir: Path) -> dict[str, int]:
+    base = Path(output_dir)
+    deleted_files = 0
+    deleted_dirs = 0
+
+    files_to_delete = [
+        base / JSONL_FILENAME,
+        base / MANIFEST_FILENAME,
+        base / PATTERN_INDEX_FILENAME,
+        base / KEYWORD_INDEX_FILENAME,
+        base / PATTERN_FAISS_FILENAME,
+        base / KEYWORD_FAISS_FILENAME,
+    ]
+    for path in files_to_delete:
+        if path.exists():
+            path.unlink()
+            deleted_files += 1
+
+    backups_dir = base / "backups"
+    if backups_dir.exists():
+        shutil.rmtree(backups_dir)
+        deleted_dirs += 1
+
+    if base.exists() and not any(base.iterdir()):
+        base.rmdir()
+        deleted_dirs += 1
+
+    return {"deleted_files": deleted_files, "deleted_dirs": deleted_dirs}
