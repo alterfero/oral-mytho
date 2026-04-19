@@ -2,4 +2,6 @@ streamlit>=1.36
 numpy>=1.26
 sentence-transformers>=3.0
 faiss-cpu>=1.8
-
+folium>=0.20
+streamlit-folium>=0.26
+torchvision>=0.26

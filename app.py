@@ -6,6 +6,13 @@ from pathlib import Path
 
 import streamlit as st
 
+try:
+    import folium
+    from streamlit_folium import st_folium
+except ModuleNotFoundError:  # pragma: no cover - optional UI dependency
+    folium = None
+    st_folium = None
+
 from mytho_app.constants import (
     APP_TITLE,
     CSV_COLUMNS,
@@ -16,6 +23,13 @@ from mytho_app.constants import (
     LONG_TEXT_FIELDS,
     PATTERN_FIELD,
     PREVIEW_FIELDS,
+)
+from mytho_app.exploration import (
+    build_exploration_network,
+    entry_id_from_map_click,
+    entry_title,
+    popup_html_for_entry,
+    primary_abstract,
 )
 from mytho_app.embeddings import (
     EmbeddingDependencyError,
@@ -44,6 +58,7 @@ st.set_page_config(page_title=APP_TITLE, page_icon="📚", layout="wide")
 LIVE_TERM_STATE_KEY = "_live_term_state"
 ADD_ENTRY_FEEDBACK_KEY = "_add_entry_feedback"
 LAST_PROCESSED_UPLOAD_KEY = "_last_processed_upload_key"
+EXPLORATION_SELECTED_ENTRY_KEY = "_exploration_selected_entry_id"
 
 
 def apply_theme() -> None:
@@ -195,7 +210,7 @@ def render_sidebar() -> str:
         else:
             st.warning("Some computed artifacts are still missing.")
 
-        page = st.radio("Navigate", ["Data processing", "Data management"], label_visibility="visible")
+        page = st.radio("Navigate", ["Data processing", "Data management", "Exploration"], label_visibility="visible")
         st.markdown("### Model")
         st.caption(EMBEDDING_MODEL_NAME)
     return page
@@ -205,6 +220,7 @@ def render_header(page: str) -> None:
     descriptions = {
         "Data processing": "Convert the source CSV into a durable JSONL dataset, build lexical indices, and generate semantic search artifacts for motifs and keywords.",
         "Data management": "Add, edit, and delete entries while reusing existing motifs and keywords through semantic suggestions.",
+        "Exploration": "Search for an idea, pick the closest existing pattern, and explore geographically linked stories plus neighboring semantic patterns on an interactive world map.",
     }
     st.markdown(
         f"""
@@ -369,7 +385,7 @@ def lexical_fallback(items: list[dict], query: str, limit: int = 5) -> list[dict
     return results[:limit]
 
 
-def find_similar_terms(kind: str, query: str, output_dir: Path) -> tuple[list[dict], str]:
+def find_similar_terms(kind: str, query: str, output_dir: Path, *, limit: int = 5) -> tuple[list[dict], str]:
     index_path, items, model_name = get_term_artifacts(kind, output_dir)
     live_state = get_live_term_state(output_dir)[kind]
     live_items = live_state["items"]
@@ -382,7 +398,7 @@ def find_similar_terms(kind: str, query: str, output_dir: Path) -> tuple[list[di
         model, index = cached_search_assets(str(index_path), model_name)
         ranked_by_term: dict[str, dict] = {}
 
-        for result in semantic_search(model, index, [item["text"] for item in items], query, limit=5):
+        for result in semantic_search(model, index, [item["text"] for item in items], query, limit=limit):
             item = items[result["position"]]
             ranked_by_term[item["normalized"]] = {
                 "text": item["text"],
@@ -392,7 +408,7 @@ def find_similar_terms(kind: str, query: str, output_dir: Path) -> tuple[list[di
             }
 
         if live_items and live_index is not None:
-            for result in semantic_search(model, live_index, [item["text"] for item in live_items], query, limit=5):
+            for result in semantic_search(model, live_index, [item["text"] for item in live_items], query, limit=limit):
                 item = live_items[result["position"]]
                 current = ranked_by_term.get(item["normalized"])
                 candidate = {
@@ -404,11 +420,11 @@ def find_similar_terms(kind: str, query: str, output_dir: Path) -> tuple[list[di
                 if current is None or candidate["score"] > current["score"]:
                     ranked_by_term[item["normalized"]] = candidate
 
-        enriched = sorted(ranked_by_term.values(), key=lambda row: (-row["score"], row["text"].lower()))[:5]
+        enriched = sorted(ranked_by_term.values(), key=lambda row: (-row["score"], row["text"].lower()))[:limit]
         return enriched, "semantic + live updates" if live_items else "semantic"
     except EmbeddingDependencyError:
         combined_items = [dict(item, is_live=False) for item in items] + [dict(item, is_live=True) for item in live_items]
-        fallback = lexical_fallback(combined_items, query, limit=5)
+        fallback = lexical_fallback(combined_items, query, limit=limit)
         enriched = []
         for result in fallback:
             item = combined_items[result["position"]]
@@ -428,66 +444,65 @@ def render_processing_page() -> None:
     jsonl_path = artifact_paths(current_output_dir())["jsonl"]
 
     st.markdown("### Source data")
-    st.info(
-        "Upload a CSV from your computer to begin. The app validates the file and, if it is well-formed, "
-        "immediately rebuilds the JSONL dataset, the lexical indices, and both semantic indices."
+    st.markdown(
+        "*Upload a CSV from your computer to begin. The app validates the file and, if it is well-formed,* "
+        "*rebuilds the internal dataset, the lexical indices, and both semantic indices.*"
     )
 
-    c1, c2 = st.columns([1.15, 1.0])
-    with c1:
-        uploaded_file = st.file_uploader(
-            "Upload a source CSV",
-            type=["csv"],
-            help="Uploading a new file replaces the current processed dataset after validation succeeds.",
-        )
-        st.caption("A timestamped backup of the existing JSONL is kept automatically before replacement.")
+    uploaded_file = st.file_uploader(
+        "Upload a source CSV",
+        type=["csv"],
+        help="Uploading a new file replaces the current processed dataset after validation succeeds.",
+    )
+    st.caption("A timestamped backup of the existing JSONL is kept automatically before replacement.")
 
-        if uploaded_file is not None:
-            uploaded_bytes = uploaded_file.getvalue()
-            upload_key = f"{current_output_dir().resolve()}::{hashlib.sha256(uploaded_bytes).hexdigest()}"
-            if st.session_state.get(LAST_PROCESSED_UPLOAD_KEY) != upload_key:
-                progress = st.progress(0)
-                status_box = st.status(f"Validating `{uploaded_file.name}`...", expanded=True)
-                try:
-                    validation = validate_uploaded_csv_bytes(uploaded_bytes)
-                    status_box.write(
-                        f"Validation passed: {validation['entry_count']} data rows and "
-                        f"{validation['column_count']} columns."
-                    )
-                    progress.progress(20, text="Validation complete")
+    if uploaded_file is not None:
+        uploaded_bytes = uploaded_file.getvalue()
+        upload_key = f"{current_output_dir().resolve()}::{hashlib.sha256(uploaded_bytes).hexdigest()}"
+        if st.session_state.get(LAST_PROCESSED_UPLOAD_KEY) != upload_key:
+            progress = st.progress(0)
+            status_box = st.status(f"Validating `{uploaded_file.name}`...", expanded=True)
+            try:
+                validation = validate_uploaded_csv_bytes(uploaded_bytes)
+                status_box.write(
+                    f"Validation passed: {validation['entry_count']} data rows and "
+                    f"{validation['column_count']} columns."
+                )
+                progress.progress(20, text="Validation complete")
 
-                    status_box.update(label="Writing JSONL dataset...", state="running")
-                    replace_jsonl_from_entries(validation["entries"], current_output_dir(), backup_existing=True)
-                    progress.progress(55, text="JSONL updated")
+                status_box.update(label="Writing JSONL dataset...", state="running")
+                replace_jsonl_from_entries(validation["entries"], current_output_dir(), backup_existing=True)
+                progress.progress(55, text="JSONL updated")
 
-                    status_box.update(label="Building pattern, keyword, and FAISS indices...", state="running")
-                    manifest = rebuild_artifacts_from_entries(
-                        validation["entries"],
-                        current_output_dir(),
-                        source_csv=uploaded_file.name,
-                    )
-                    progress.progress(100, text="Processing finished")
+                status_box.update(label="Building pattern, keyword, and FAISS indices...", state="running")
+                manifest = rebuild_artifacts_from_entries(
+                    validation["entries"],
+                    current_output_dir(),
+                    source_csv=uploaded_file.name,
+                )
+                progress.progress(100, text="Processing finished")
 
-                    clear_caches()
-                    clear_live_term_state()
-                    st.session_state[LAST_PROCESSED_UPLOAD_KEY] = upload_key
-                    status_box.update(label="Upload validated and processing finished.", state="complete", expanded=False)
-                    st.success(
-                        f"Processed `{uploaded_file.name}` successfully: {manifest['entry_count']} entries, "
-                        f"{manifest['pattern_count']} patterns, and {manifest['keyword_count']} keywords."
-                    )
-                    status = artifact_status(current_output_dir())
-                except CSVValidationError as exc:
-                    status_box.update(label="Upload validation failed.", state="error", expanded=True)
-                    st.error(str(exc))
-                except EmbeddingDependencyError as exc:
-                    status_box.update(label="Upload saved to JSONL, but processing failed.", state="error", expanded=True)
-                    st.error(
-                        f"The file passed validation and the JSONL was replaced, but semantic processing failed: {exc}"
-                    )
-            else:
-                st.caption(f"`{uploaded_file.name}` is already the current processed source for this output directory.")
+                clear_caches()
+                clear_live_term_state()
+                st.session_state[LAST_PROCESSED_UPLOAD_KEY] = upload_key
+                status_box.update(label="Upload validated and processing finished.", state="complete", expanded=False)
+                st.success(
+                    f"Processed `{uploaded_file.name}` successfully: {manifest['entry_count']} entries, "
+                    f"{manifest['pattern_count']} patterns, and {manifest['keyword_count']} keywords."
+                )
+                status = artifact_status(current_output_dir())
+            except CSVValidationError as exc:
+                status_box.update(label="Upload validation failed.", state="error", expanded=True)
+                st.error(str(exc))
+            except EmbeddingDependencyError as exc:
+                status_box.update(label="Upload saved to JSONL, but processing failed.", state="error", expanded=True)
+                st.error(
+                    f"The file passed validation and the JSONL was replaced, but semantic processing failed: {exc}"
+                )
+        else:
+            st.caption(f"`{uploaded_file.name}` is already the current processed source for this output directory.")
 
+    with st.sidebar:
         st.markdown("### Export")
         st.caption("Download a new CSV rebuilt from the current JSONL dataset.")
         if jsonl_path.exists():
@@ -505,14 +520,13 @@ def render_processing_page() -> None:
             st.button("Export latest JSONL to CSV", disabled=True, use_container_width=True)
             st.caption("The export button will be available after a valid CSV upload has been processed.")
 
-    with c2:
-        st.markdown("### Current artifact status")
-        display_status_badges(status)
-        show_manifest_summary(status)
-        st.caption(
-            "Uploading a valid CSV replaces the working dataset. After that, edits happen in JSONL and stay in sync "
-            "with the semantic indices automatically."
-        )
+    st.markdown("### Current artifact status")
+    display_status_badges(status)
+    show_manifest_summary(status)
+    st.caption(
+        "Uploading a valid CSV replaces the working dataset. After that, edits happen in JSONL and stay in sync "
+        "with the semantic indices automatically."
+    )
 
 
 def preview_entry(entry: dict) -> None:
@@ -624,7 +638,7 @@ def render_fields_editor(prefix: str, draft: dict) -> dict[str, str]:
     updated_fields = dict(fields)
 
     for section_title, columns in FIELD_SECTIONS:
-        with st.expander(section_title, expanded=section_title == "Titles and Summaries"):
+        with st.expander(section_title):
             for field_name in columns:
                 widget_key = f"{prefix}_{field_name}"
                 initial_value = clean_text(fields.get(field_name, ""))
@@ -798,7 +812,7 @@ def render_delete_tab(output_dir: Path, entries: list[dict]) -> None:
             )
 
 
-def ensure_management_artifacts_ready(output_dir: Path) -> tuple[dict, str | None, str | None]:
+def ensure_semantic_artifacts_ready(output_dir: Path) -> tuple[dict, str | None, str | None]:
     status = artifact_status(output_dir)
     if status["ready"] or not status["jsonl_ready"]:
         return status, None, None
@@ -821,7 +835,7 @@ def ensure_management_artifacts_ready(output_dir: Path) -> tuple[dict, str | Non
 def render_management_page() -> None:
     output_dir = current_output_dir()
     get_live_term_state(output_dir)
-    status, auto_refresh_message, auto_refresh_error = ensure_management_artifacts_ready(output_dir)
+    status, auto_refresh_message, auto_refresh_error = ensure_semantic_artifacts_ready(output_dir)
     st.markdown("### Dataset summary")
     show_manifest_summary(status)
 
@@ -850,6 +864,25 @@ def render_management_page() -> None:
     entries = read_jsonl(jsonl_path)
     entries.sort(key=lambda item: entry_label(item).lower())
 
+    with st.sidebar:
+        st.markdown("### Export")
+        st.caption("Download a new CSV rebuilt from the current JSONL dataset.")
+        if jsonl_path.exists():
+            export_entries = read_jsonl(jsonl_path)
+            export_bytes = entries_to_csv_bytes(export_entries)
+            export_stamp = datetime.fromtimestamp(jsonl_path.stat().st_mtime).strftime("%Y%m%d-%H%M%S")
+            st.download_button(
+                "Export current version to CSV",
+                data=export_bytes,
+                file_name=f"entries-from-jsonl-{export_stamp}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.button("Export latest JSONL to CSV", disabled=True, use_container_width=True)
+            st.caption("The export button will be available after a valid CSV upload has been processed.")
+
+
     add_tab, edit_tab, delete_tab = st.tabs(["Add entry", "Edit entry", "Delete entry"])
     with add_tab:
         render_add_tab(output_dir)
@@ -857,6 +890,289 @@ def render_management_page() -> None:
         render_edit_tab(output_dir, entries)
     with delete_tab:
         render_delete_tab(output_dir, entries)
+
+
+def render_exploration_details(marker: dict | None) -> None:
+    st.markdown("### Story detail")
+    if not marker:
+        st.info("Click a marker on the map to inspect a story.")
+        return
+
+    entry = marker["entry"]
+    fields = entry.get("fields", {})
+    abstract = primary_abstract(entry)
+
+    st.markdown(f"#### {entry_title(entry)}")
+    badges = [entry["entry_id"]]
+    if marker["kind"] == "original":
+        badges.append("Selected pattern")
+    else:
+        badges.append(f"Similarity {marker['similarity']:.3f}")
+    territory = clean_text(fields.get("territory", ""))
+    if territory:
+        badges.append(territory)
+    st.caption(" · ".join(badges))
+
+    if abstract:
+        st.markdown("**Abstract**")
+        st.write(abstract)
+
+    if marker["matched_patterns"]:
+        st.markdown("**Matched patterns**")
+        for item in marker["matched_patterns"][:6]:
+            if marker["kind"] == "original":
+                st.markdown(f"- {item['pattern']}")
+            else:
+                st.markdown(f"- {item['pattern']} ({item['score']:.3f})")
+
+    with st.expander("Full entry", expanded=True):
+        for field_name in CSV_COLUMNS:
+            value = clean_text(fields.get(field_name, ""))
+            if not value:
+                continue
+            st.markdown(f"**{field_name}**")
+            st.write(value)
+
+
+def render_exploration_map(network: dict, *, map_key: str) -> str | None:
+    if folium is None or st_folium is None:
+        st.error("The map dependencies are not installed. Install `folium` and `streamlit-folium` to use Exploration.")
+        return None
+
+    all_markers = network["original_markers"] + network["related_markers"]
+    if not all_markers:
+        return None
+
+    primary_marker = network["original_markers"][0] if network["original_markers"] else network["related_markers"][0]
+    story_map = folium.Map(
+        location=list(primary_marker["coordinates"]),
+        zoom_start=3,
+        control_scale=True,
+        prefer_canvas=True,
+    )
+
+    related_group = folium.FeatureGroup(name=f"Similar-pattern stories ({len(network['related_markers'])})", show=True)
+    connection_group = folium.FeatureGroup(name="Connections", show=True)
+    original_group = folium.FeatureGroup(name=f"Selected pattern stories ({len(network['original_markers'])})", show=True)
+
+    for connection in network["connections"]:
+        folium.PolyLine(
+            locations=[connection["source_coordinates"], connection["target_coordinates"]],
+            color=connection["color"],
+            weight=3,
+            opacity=0.62,
+            dash_array="8 8",
+        ).add_to(connection_group)
+
+    for marker in network["related_markers"]:
+        related_patterns = ", ".join(item["pattern"] for item in marker["matched_patterns"][:3])
+        popup_lines = [
+            f"<strong>{marker['title']}</strong>",
+            f"Entry {marker['entry_id']}",
+            f"Similarity {marker['similarity']:.3f}",
+        ]
+        if related_patterns:
+            popup_lines.append(f"Patterns: {related_patterns}")
+        folium.CircleMarker(
+            location=list(marker["coordinates"]),
+            radius=6,
+            color="#1f2937",
+            weight=1.5,
+            fill=True,
+            fill_color=marker["color"],
+            fill_opacity=0.82,
+            tooltip=marker["hover_title"],
+            popup=folium.Popup(popup_html_for_entry(marker["entry_id"], popup_lines), max_width=360),
+        ).add_to(related_group)
+
+    related_group.add_to(story_map)
+    connection_group.add_to(story_map)
+
+    for marker in network["original_markers"]:
+        popup_lines = [
+            f"<strong>{marker['title']}</strong>",
+            f"Entry {marker['entry_id']}",
+            "Selected pattern story",
+        ]
+        folium.CircleMarker(
+            location=list(marker["coordinates"]),
+            radius=9,
+            color="#ffffff",
+            weight=2.5,
+            fill=True,
+            fill_color="#d7263d",
+            fill_opacity=1.0,
+            tooltip=marker["hover_title"],
+            popup=folium.Popup(popup_html_for_entry(marker["entry_id"], popup_lines), max_width=320),
+        ).add_to(original_group)
+
+    original_group.add_to(story_map)
+
+    if network["bounds"]:
+        story_map.fit_bounds(network["bounds"], padding=(28, 28))
+
+    map_state = st_folium(
+        story_map,
+        key=map_key,
+        height=640,
+        use_container_width=True,
+        returned_objects=["last_object_clicked", "last_object_clicked_popup"],
+    )
+    clicked_entry_id = entry_id_from_map_click(
+        all_markers,
+        clean_text((map_state or {}).get("last_object_clicked_popup", "")),
+        (map_state or {}).get("last_object_clicked"),
+    )
+    return clicked_entry_id
+
+
+def render_exploration_page() -> None:
+    output_dir = current_output_dir()
+    get_live_term_state(output_dir)
+    status, auto_refresh_message, auto_refresh_error = ensure_semantic_artifacts_ready(output_dir)
+
+    st.markdown("### Explore story geography")
+    st.caption(
+        "Describe an idea, pick the closest indexed pattern, then inspect where matching stories sit in relation "
+        "to stories tagged with semantically similar patterns."
+    )
+
+    if auto_refresh_message:
+        st.success(auto_refresh_message)
+    if auto_refresh_error:
+        st.error(
+            "The app detected that the computed indices were missing or out of date, "
+            f"but automatic refresh failed: {auto_refresh_error}"
+        )
+
+    if not status["ready"]:
+        st.markdown("### Artifact verification")
+        display_status_badges(status)
+        st.warning(
+            "Exploration is available after the JSONL, both lexical indices, both FAISS indices, "
+            "and the manifest have all been created."
+        )
+        return
+
+    entries = read_jsonl(artifact_paths(output_dir)["jsonl"])
+    if not entries:
+        st.info("No stories are available yet.")
+        return
+
+    query = st.text_input(
+        "Describe the pattern you want to explore",
+        key="exploration_query",
+        placeholder="Example: someone gets inside a coconut and drifts at sea",
+    )
+
+    suggestions: list[dict] = []
+    search_mode = ""
+    if query.strip():
+        raw_suggestions, search_mode = find_similar_terms("patterns", query, output_dir, limit=12)
+        suggestions = [item for item in raw_suggestions if not item.get("is_live")]
+
+    if not query.strip():
+        st.info("Start with a sentence or motif description to retrieve the closest existing patterns.")
+        return
+
+    if not suggestions:
+        st.warning("No existing pattern matched that description closely enough to explore yet.")
+        return
+
+    option_map = {
+        (
+            f"{item['text']} · similarity {item['score']:.3f} · "
+            f"{item['entry_count']} stor{'y' if item['entry_count'] == 1 else 'ies'}"
+        ): item
+        for item in suggestions
+    }
+    selected_label = st.selectbox(
+        "Closest existing patterns",
+        list(option_map.keys()),
+        key="exploration_selected_pattern",
+        help=f"Suggestions are based on {search_mode}.",
+    )
+    selected_pattern = option_map[selected_label]["text"]
+
+    related_candidates, related_mode = find_similar_terms("patterns", selected_pattern, output_dir, limit=60)
+    related_patterns = [
+        item
+        for item in related_candidates
+        if normalize_text(item["text"]) != normalize_text(selected_pattern)
+    ]
+
+    st.markdown("### Similarity filter")
+    st.caption("Show only related stories whose similarity score is at or above this threshold.")
+    slider_col, value_col = st.columns([5, 1.2])
+    with slider_col:
+        threshold = st.slider(
+            "Minimum similarity",
+            min_value=0.00,
+            max_value=1.00,
+            value=0.62,
+            step=0.01,
+            format="%.2f",
+            key="exploration_threshold",
+        )
+    with value_col:
+        st.metric("Current", f"{threshold:.2f}")
+    displayed_related_patterns = [item for item in related_patterns if float(item["score"]) >= threshold]
+
+    network = build_exploration_network(
+        entries,
+        selected_pattern,
+        displayed_related_patterns,
+        minimum_similarity=threshold,
+    )
+    visible_markers = {
+        marker["entry_id"]: marker for marker in network["original_markers"] + network["related_markers"]
+    }
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Original stories", len(network["original_markers"]))
+    metric_columns[1].metric("Similar-pattern stories", len(network["related_markers"]))
+    metric_columns[2].metric("Similar patterns", len(displayed_related_patterns))
+    metric_columns[3].metric("Connections", len(network["connections"]))
+
+    st.caption(
+        f"Selected pattern: {selected_pattern} · related patterns computed with {related_mode}. "
+        f"Showing related stories at similarity {threshold:.2f} or above."
+    )
+    if network["original_story_count"] > len(network["original_markers"]):
+        st.caption(
+            f"{network['original_story_count'] - len(network['original_markers'])} exact-pattern stor"
+            f"{'y is' if network['original_story_count'] - len(network['original_markers']) == 1 else 'ies are'} "
+            "not visible on the map because their coordinates are missing or malformed."
+        )
+    if network["missing_original_coords"] or network["missing_related_coords"]:
+        st.caption(
+            f"{network['missing_original_coords']} original stor{'y' if network['missing_original_coords'] == 1 else 'ies'} "
+            f"and {network['missing_related_coords']} related stor{'y' if network['missing_related_coords'] == 1 else 'ies'} "
+            "were skipped because their `space coord` could not be mapped."
+        )
+
+    with st.expander("Patterns currently shown", expanded=False):
+        st.markdown(f"- {selected_pattern} (selected pattern)")
+        for item in displayed_related_patterns:
+            st.markdown(f"- {item['text']} ({item['score']:.3f})")
+
+    map_col, detail_col = st.columns([1.65, 1.0])
+    with map_col:
+        clicked_entry_id = render_exploration_map(
+            network,
+            map_key=f"exploration_map_{normalize_text(selected_pattern)}_{threshold:.2f}",
+        )
+        if clicked_entry_id and clicked_entry_id in visible_markers:
+            st.session_state[EXPLORATION_SELECTED_ENTRY_KEY] = clicked_entry_id
+        elif st.session_state.get(EXPLORATION_SELECTED_ENTRY_KEY) not in visible_markers:
+            st.session_state.pop(EXPLORATION_SELECTED_ENTRY_KEY, None)
+
+        if not visible_markers:
+            st.warning("No stories with usable coordinates are available for this pattern and threshold.")
+
+    with detail_col:
+        selected_entry_id = st.session_state.get(EXPLORATION_SELECTED_ENTRY_KEY)
+        render_exploration_details(visible_markers.get(selected_entry_id))
 
 
 def main() -> None:
@@ -867,8 +1183,10 @@ def main() -> None:
 
     if page == "Data processing":
         render_processing_page()
-    else:
+    elif page == "Data management":
         render_management_page()
+    else:
+        render_exploration_page()
 
 
 if __name__ == "__main__":
