@@ -12,6 +12,19 @@ ENTRY_ID_POPUP_RE = re.compile(r'data-entry-id="([^"]+)"')
 
 RED_RGB = (215, 38, 61)
 BLUE_RGB = (44, 123, 182)
+ORIGINAL_STORY_FALLBACK_COORDINATES = (0.0, 170.0)
+RELATED_STORY_FALLBACK_CENTER = (0.0, 170.0)
+RELATED_STORY_FALLBACK_RING = (
+    (0.0, 0.0),
+    (0.9, 0.0),
+    (-0.9, 0.0),
+    (0.0, 0.9),
+    (0.0, -0.9),
+    (0.7, 0.7),
+    (0.7, -0.7),
+    (-0.7, 0.7),
+    (-0.7, -0.7),
+)
 
 
 def _apply_direction(value: float, direction: str) -> float:
@@ -140,6 +153,7 @@ def _marker_payload(
     similarity: float,
     matched_patterns: list[dict],
     color: str,
+    has_location: bool = True,
 ) -> dict:
     return {
         "entry_id": entry["entry_id"],
@@ -152,7 +166,16 @@ def _marker_payload(
         "title": entry_title(entry),
         "hover_title": english_story_title(entry),
         "abstract": primary_abstract(entry),
+        "has_location": has_location,
     }
+
+
+def _related_story_fallback_coordinates(index: int) -> tuple[float, float]:
+    lat_offset, lon_offset = RELATED_STORY_FALLBACK_RING[index % len(RELATED_STORY_FALLBACK_RING)]
+    return (
+        RELATED_STORY_FALLBACK_CENTER[0] + lat_offset,
+        RELATED_STORY_FALLBACK_CENTER[1] + lon_offset,
+    )
 
 
 def build_exploration_network(
@@ -176,9 +199,10 @@ def build_exploration_network(
     original_entries = entries_by_pattern.get(selected_marker, [])
     for pattern_text, entry in original_entries:
         coordinates = parse_space_coord(entry.get("fields", {}).get("space coord", ""))
+        has_location = coordinates is not None
         if coordinates is None:
             missing_original_coords += 1
-            continue
+            coordinates = ORIGINAL_STORY_FALLBACK_COORDINATES
         original_ids.add(entry["entry_id"])
         original_markers.append(
             _marker_payload(
@@ -188,12 +212,14 @@ def build_exploration_network(
                 similarity=1.0,
                 matched_patterns=[{"pattern": pattern_text, "score": 1.0}],
                 color=similarity_to_color(1.0, minimum_similarity),
+                has_location=has_location,
             )
         )
 
     related_by_entry_id: dict[str, dict] = {}
     missing_related_coords = 0
     seen_missing_related: set[str] = set()
+    missing_related_index = 0
     for relation in related_patterns:
         pattern_text = clean_text(relation.get("text", ""))
         pattern_marker = normalize_text(pattern_text)
@@ -205,11 +231,21 @@ def build_exploration_network(
             if entry_id in original_ids:
                 continue
             coordinates = parse_space_coord(entry.get("fields", {}).get("space coord", ""))
+            has_location = coordinates is not None
             if coordinates is None:
                 if entry_id not in seen_missing_related:
                     missing_related_coords += 1
                     seen_missing_related.add(entry_id)
-                continue
+                    coordinates = _related_story_fallback_coordinates(missing_related_index)
+                    missing_related_index += 1
+                else:
+                    marker = related_by_entry_id.get(entry_id)
+                    if marker is not None:
+                        marker["matched_patterns"].append({"pattern": matched_pattern_text, "score": score})
+                        if score > marker["similarity"]:
+                            marker["similarity"] = score
+                            marker["color"] = similarity_to_color(score, minimum_similarity)
+                    continue
 
             marker = related_by_entry_id.get(entry_id)
             if marker is None:
@@ -220,6 +256,7 @@ def build_exploration_network(
                     similarity=score,
                     matched_patterns=[],
                     color=similarity_to_color(score, minimum_similarity),
+                    has_location=has_location,
                 )
                 related_by_entry_id[entry_id] = marker
 

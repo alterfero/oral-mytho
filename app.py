@@ -950,6 +950,8 @@ def render_exploration_details(marker: dict | None) -> None:
         badges.append("Selected pattern")
     else:
         badges.append(f"Similarity {marker['similarity']:.3f}")
+    if not marker.get("has_location", True):
+        badges.append("no location")
     territory = clean_text(fields.get("territory", ""))
     if territory:
         badges.append(territory)
@@ -1013,6 +1015,8 @@ def render_exploration_map(network: dict, *, map_key: str) -> str | None:
             f"Entry {marker['entry_id']}",
             f"Similarity {marker['similarity']:.3f}",
         ]
+        if not marker.get("has_location", True):
+            popup_lines.append("no location")
         if related_patterns:
             popup_lines.append(f"Patterns: {related_patterns}")
         folium.CircleMarker(
@@ -1036,6 +1040,8 @@ def render_exploration_map(network: dict, *, map_key: str) -> str | None:
             f"Entry {marker['entry_id']}",
             "Selected pattern story",
         ]
+        if not marker.get("has_location", True):
+            popup_lines.append("no location")
         folium.CircleMarker(
             location=list(marker["coordinates"]),
             radius=9,
@@ -1180,17 +1186,17 @@ def render_exploration_page() -> None:
         f"Selected pattern: {selected_pattern} · related patterns computed with {related_mode}. "
         f"Showing related stories at similarity {threshold:.2f} or above."
     )
-    if network["original_story_count"] > len(network["original_markers"]):
+    if network["missing_original_coords"]:
         st.caption(
-            f"{network['original_story_count'] - len(network['original_markers'])} exact-pattern stor"
-            f"{'y is' if network['original_story_count'] - len(network['original_markers']) == 1 else 'ies are'} "
-            "not visible on the map because their coordinates are missing or malformed."
+            f"{network['missing_original_coords']} exact-pattern stor"
+            f"{'y is' if network['missing_original_coords'] == 1 else 'ies are'} "
+            "shown at 170 E, 0 with the label `no location` because the original coordinates are missing or malformed."
         )
-    if network["missing_original_coords"] or network["missing_related_coords"]:
+    if network["missing_related_coords"]:
         st.caption(
-            f"{network['missing_original_coords']} original stor{'y' if network['missing_original_coords'] == 1 else 'ies'} "
-            f"and {network['missing_related_coords']} related stor{'y' if network['missing_related_coords'] == 1 else 'ies'} "
-            "were skipped because their `space coord` could not be mapped."
+            f"{network['missing_related_coords']} related stor"
+            f"{'y is' if network['missing_related_coords'] == 1 else 'ies are'} "
+            "shown around 170 E, 0 with the label `no location` because their coordinates are missing or malformed."
         )
 
     with st.expander("Patterns currently shown", expanded=False):

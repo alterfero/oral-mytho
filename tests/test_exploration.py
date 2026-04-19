@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 
 from mytho_app.exploration import (
+    ORIGINAL_STORY_FALLBACK_COORDINATES,
+    RELATED_STORY_FALLBACK_CENTER,
     build_exploration_network,
     english_story_title,
     entry_id_from_map_click,
@@ -102,16 +104,23 @@ class ExplorationNetworkTests(unittest.TestCase):
         )
 
         self.assertEqual(network["original_story_count"], 4)
-        self.assertEqual(len(network["original_markers"]), 3)
+        self.assertEqual(len(network["original_markers"]), 4)
         self.assertEqual(network["missing_original_coords"], 1)
+        fallback_marker = next(marker for marker in network["original_markers"] if marker["entry_id"] == "original-missing")
+        self.assertEqual(fallback_marker["coordinates"], ORIGINAL_STORY_FALLBACK_COORDINATES)
+        self.assertFalse(fallback_marker["has_location"])
 
-        self.assertEqual(len(network["related_markers"]), 2)
+        self.assertEqual(len(network["related_markers"]), 3)
         self.assertEqual(network["missing_related_coords"], 1)
-        self.assertEqual(len(network["connections"]), 2)
+        self.assertEqual(len(network["connections"]), 3)
 
         related_marker = next(marker for marker in network["related_markers"] if marker["entry_id"] == "related-b")
         self.assertEqual(related_marker["similarity"], 0.81)
         self.assertEqual([item["pattern"] for item in related_marker["matched_patterns"]], ["Related one", "Related two"])
+        missing_related_marker = next(marker for marker in network["related_markers"] if marker["entry_id"] == "related-missing")
+        self.assertFalse(missing_related_marker["has_location"])
+        self.assertAlmostEqual(missing_related_marker["coordinates"][0], RELATED_STORY_FALLBACK_CENTER[0])
+        self.assertAlmostEqual(missing_related_marker["coordinates"][1], RELATED_STORY_FALLBACK_CENTER[1])
 
         visible_ids = {marker["entry_id"] for marker in network["related_markers"]}
         self.assertNotIn("overlap", visible_ids)
